@@ -13,3 +13,7 @@ python peloton_date_graphs.py --list-timezones
 
 # Help (also prints automatically if you run with no args)
 python peloton_date_graphs.py --help
+
+#use a stacked graph
+python peloton_date_graphs.py --username you@example.com --tz "America/New_York" --cleanup --stacked
+

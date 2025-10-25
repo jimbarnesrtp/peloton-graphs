@@ -359,7 +359,7 @@ def plot_single_graph(series: WorkoutSeries, ftp: float, out_dir: str, ride_meta
     ymin, ymax = _normalized_y_limits_for_zones(ftp, signal_max)
 
     zones = compute_zone_bands(ftp)
-    zone_colors = ["#e1e3ff","#a7f1f1","#a8ffb5","#fff78a","#ffc37b","#ff9bbd","#ff7c7c"]
+    zone_colors = ["#e6f2ff","#99ccff","#a8ffb5","#fff78a","#ffc37b","#ff9bbd","#ff7c7c"]
     for i, (_, lo, hi) in enumerate(zones):
         hi_capped = min(hi if hi != float('inf') else ymax, ymax)
         ax.axhspan(lo, hi_capped, alpha=0.35, color=zone_colors[i])
@@ -459,6 +459,168 @@ def plot_split_graphs(series: WorkoutSeries, ftp: float, out_dir: str, ride_meta
 
     return out_path_1, out_path_2
 
+def plot_stacked_graphs(series: WorkoutSeries, ftp: float, out_dir: str, ride_meta: dict, stats: dict, args) -> str:
+    """
+    One image with two vertically-stacked subplots (dominant top):
+      Top:    Heart Rate (left Y) vs Output/Power (right Y) with FTP zone bands
+      Bottom: Cadence (left Y), optional Resistance (right Y). No power on bottom.
+    Supports HR preprocessing: ignore initial minutes, optional lead/lag shift, optional smoothing.
+    """
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11})
+    fig, (ax_top_left, ax_bot_left) = plt.subplots(
+        2, 1, figsize=(14, 10), sharex=True,
+        gridspec_kw={"height_ratios": [2, 1]}  # top subplot dominant
+    )
+    fig.patch.set_facecolor("white")
+
+    # -------------------------
+    # Timebase & series
+    # -------------------------
+    xsecs = series.seconds[:]  # seconds from workout start
+    xmins = [s / 60.0 for s in xsecs]
+    power_vals = [v if v is not None else float('nan') for v in series.values]
+
+    # Optional overlays (already prepared upstream)
+    raw_hr  = (ride_meta.get("_hr_vals") or [])[:len(xsecs)]
+    cad_vals = (ride_meta.get("_cad_vals") or [])[:len(xsecs)]
+    res_vals = (ride_meta.get("_res_vals") or [])[:len(xsecs)]
+
+    # Estimate sampling step (sec)
+    if len(xsecs) >= 3:
+        steps = [max(1, xsecs[i] - xsecs[i-1]) for i in range(1, len(xsecs))]
+        step_sec = sorted(steps)[len(steps)//2]  # median robust
+    else:
+        step_sec = 1
+
+    # -------------------------
+    # HR preprocessing (align & clean)
+    # -------------------------
+    def _ma(vals, win):
+        if win <= 1: return vals
+        buf = []
+        s = 0.0
+        from collections import deque
+        q = deque()
+        for v in vals:
+            if v is None: v = float('nan')
+            q.append(v)
+            s += v if not math.isnan(v) else 0.0
+            if len(q) > win:
+                left = q.popleft()
+                if not math.isnan(left): s -= left
+            # compute average over non-NaNs in window
+            non_n = sum(0 if math.isnan(u) else 1 for u in q)
+            buf.append((s / non_n) if non_n else float('nan'))
+        return buf
+
+    hr_vals = raw_hr[:]
+
+    # 1) Ignore first N minutes of HR
+    if args.hr_ignore_min and args.hr_ignore_min > 0:
+        n_ignore = int(round((args.hr_ignore_min * 60) / step_sec))
+        for i in range(min(n_ignore, len(hr_vals))):
+            hr_vals[i] = float('nan')
+
+    # 2) Lead/Lag HR to align with power (positive = shift left/earlier)
+    if args.hr_lead_sec and args.hr_lead_sec != 0.0:
+        n = int(round(args.hr_lead_sec / step_sec))
+        if n > 0:  # lead: drop first n, pad tail
+            hr_vals = hr_vals[n:] + [float('nan')] * min(n, len(xsecs))
+        elif n < 0:  # lag: pad head, drop tail
+            n = abs(n)
+            hr_vals = [float('nan')] * min(n, len(xsecs)) + hr_vals[:-n]
+
+    # 3) Smooth HR with moving-average over N seconds (optional)
+    if args.hr_smooth_sec and args.hr_smooth_sec > 0:
+        import math
+        win = max(1, int(round(args.hr_smooth_sec / step_sec)))
+        hr_vals = _ma(hr_vals, win)
+
+    # -------------------------
+    # TOP: HR (left) vs Output/Power (right) + Zones
+    # -------------------------
+    ax_hr  = ax_top_left
+    ax_pow = ax_hr.twinx()
+    ax_hr.set_facecolor("#f9f9f9")
+
+    try:
+        signal_max = max(v for v in series.values if v is not None)
+    except ValueError:
+        signal_max = 0
+    ymin, ymax = _normalized_y_limits_for_zones(ftp, signal_max)
+
+    zones = compute_zone_bands(ftp)
+    zone_colors = ["#e1e3ff","#a7f1f1","#a8ffb5","#fff78a","#ffc37b","#ff9bbd","#ff7c7c"]
+    for i, (_, lo, hi) in enumerate(zones):
+        hi_capped = min(hi if hi != float('inf') else ymax, ymax)
+        ax_pow.axhspan(lo, hi_capped, alpha=0.35, color=zone_colors[i], zorder=0)
+
+    # HR in RED; Power in default color
+    hr_line = None
+    if hr_vals:
+        hr_line, = ax_hr.plot(xmins, hr_vals,
+                              linewidth=1.8, alpha=0.95, label="Heart Rate",
+                              color="#d9534f")  # red tone
+
+    pow_line, = ax_pow.plot(xmins, power_vals,
+                            linewidth=2.2, alpha=0.95, label="Output/Power")
+
+    ax_hr.set_ylabel("Heart Rate (bpm)", fontweight="bold")
+    ax_pow.set_ylabel("Watts", fontweight="bold")
+    ax_hr.grid(True, linestyle="--", alpha=0.35)
+    ax_pow.set_ylim(bottom=ymin, top=ymax)
+    ax_hr.set_xlim(left=0)
+
+    handles_top = [h for h in [hr_line, pow_line] if h is not None]
+    if handles_top:
+        ax_hr.legend(handles_top, [h.get_label() for h in handles_top],
+                     loc="upper left", fontsize=9, framealpha=0.9)
+
+    # -------------------------
+    # BOTTOM: Cadence (left), optional Resistance (right). No power here.
+    # -------------------------
+    ax_cad = ax_bot_left
+    ax_cad.set_facecolor("#f9f9f9")
+
+    cad_line = None
+    if cad_vals:
+        cad_line, = ax_cad.plot(xmins, cad_vals,
+                                linestyle="--", linewidth=1.4, alpha=0.95, label="Cadence")
+
+    res_line = None
+    if res_vals:
+        ax_res = ax_cad.twinx()
+        res_line, = ax_res.plot(xmins, res_vals,
+                                linestyle=":", linewidth=1.2, alpha=0.9, label="Resistance")
+        ax_res.set_ylabel("Resistance (%)", fontweight="bold")
+    else:
+        ax_res = None
+
+    ax_cad.set_xlabel("Time (minutes)", fontweight="bold")
+    ax_cad.set_ylabel("Cadence (rpm)", fontweight="bold")
+    ax_cad.grid(True, linestyle="--", alpha=0.35)
+
+    handles_bot = [h for h in [cad_line, res_line] if h is not None]
+    if handles_bot:
+        ax_cad.legend(handles_bot, [h.get_label() for h in handles_bot],
+                      loc="upper left", fontsize=9, framealpha=0.9)
+
+    # -------------------------
+    # Global header/footer
+    # -------------------------
+    _annotate_header_footer(fig, series, ftp, ride_meta, stats)
+
+    # Save
+    os.makedirs(out_dir, exist_ok=True)
+    ts = dt.datetime.fromtimestamp(series.start_time).strftime("%Y%m%d_%H%M")
+    out_path = os.path.join(out_dir, f"{ts}_{series.workout_id[:8]}_stacked.png")
+    plt.tight_layout(rect=[0, 0.07, 1, 0.90])  # leave space for header/footer
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+
 # ---------- HTML ----------
 def write_inline_gallery(outdir: str, image_paths: List[str], page_title: str, username: str, date_label: str):
     os.makedirs(outdir, exist_ok=True)
@@ -508,6 +670,13 @@ def main():
     parser.add_argument("--cleanup", action="store_true", help="If set, clear the output directory before writing new files.")
     parser.add_argument("--debug-api", action="store_true", help="Print truncated JSON of Peloton API responses (filtered set).")
     parser.add_argument("--list-timezones", action="store_true", help="List available IANA timezones detected on this system and exit.")
+    parser.add_argument("--stacked", action="store_true",help="One image with two stacked subplots (top: HR vs Output+Zones; bottom: Cadence vs Output).")
+    parser.add_argument("--hr-ignore-min", type=float, default=0.0,
+        help="Minutes of heart-rate to ignore/mask from the start (e.g., 2.5)")
+    parser.add_argument("--hr-lead-sec", type=float, default=0.0,
+        help="Shift HR curve left (lead) by N seconds to align with power; negative to lag")
+    parser.add_argument("--hr-smooth-sec", type=float, default=0.0,
+        help="Apply a simple moving-average smoothing window to HR, in seconds (e.g., 10)")
 
     # Auto-print help if no arguments at all
     if len(sys.argv) == 1:
@@ -661,7 +830,11 @@ def main():
             duration=duration, metric_slug=slug, seconds=seconds, values=values
         )
 
-        if args.two_graphs:
+        if args.stacked:
+            p = plot_stacked_graphs(series, ftp, args.outdir, ride_meta, stats, args)
+            produced_images.append(p)
+            print(f"Saved: {p}")
+        elif args.two_graphs:
             p1, p2 = plot_split_graphs(series, ftp, args.outdir, ride_meta, stats)
             produced_images.extend([p1, p2])
             print(f"Saved: {p1}")

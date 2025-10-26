@@ -408,7 +408,7 @@ def plot_split_graphs(series: WorkoutSeries, ftp: float, out_dir: str, ride_meta
     ymin, ymax = _normalized_y_limits_for_zones(ftp, signal_max)
 
     zones = compute_zone_bands(ftp)
-    zone_colors = ["#e1e3ff","#a7f1f1","#a8ffb5","#fff78a","#ffc37b","#ff9bbd","#ff7c7c"]
+    zone_colors = ["#e6f2ff","#99ccff","#a8ffb5","#fff78a","#ffc37b","#ff9bbd","#ff7c7c"]
     for i, (_, lo, hi) in enumerate(zones):
         hi_capped = min(hi if hi != float('inf') else ymax, ymax)
         ax1.axhspan(lo, hi_capped, alpha=0.35, color=zone_colors[i])
@@ -550,7 +550,7 @@ def plot_stacked_graphs(series: WorkoutSeries, ftp: float, out_dir: str, ride_me
     ymin, ymax = _normalized_y_limits_for_zones(ftp, signal_max)
 
     zones = compute_zone_bands(ftp)
-    zone_colors = ["#e1e3ff","#a7f1f1","#a8ffb5","#fff78a","#ffc37b","#ff9bbd","#ff7c7c"]
+    zone_colors = ["#e6f2ff","#99ccff","#a8ffb5","#fff78a","#ffc37b","#ff9bbd","#ff7c7c"]
     for i, (_, lo, hi) in enumerate(zones):
         hi_capped = min(hi if hi != float('inf') else ymax, ymax)
         ax_pow.axhspan(lo, hi_capped, alpha=0.35, color=zone_colors[i], zorder=0)

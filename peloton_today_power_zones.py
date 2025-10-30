@@ -4,7 +4,7 @@ Peloton "Rides for a Date" Graphs (Cookie Auth Version)
 
 Usage example:
 
-python3 peloton_cookie_mode.py \
+python3 peloton_today_power_zones.py \
   --cookie 'peloton_session_id=abc123; peloton_device_id=xyz789; ...' \
   --tz America/New_York \
   --date 2025-10-30 \

@@ -1,26 +1,15 @@
 #!/usr/bin/env python3
 """
-Peloton "Rides for a Date" Graphs (Selenium-powered login)
+Peloton "Rides for a Date" Graphs (cookie+token auth version)
 
-Flow:
-1. Script opens a real Chrome window.
-2. You log into Peloton in that browser.
-3. You come back to terminal and press Enter.
-4. Script collects the browser cookies, builds an authenticated requests.Session,
-   calls Peloton APIs, and generates graphs + HTML gallery.
+Flow now:
+1. We open a real Chrome window.
+2. You log in manually to https://members.onepeloton.com (MFA etc.).
+3. We scrape localStorage for an access_token that Peloton's web app uses.
+4. We build a requests.Session() with Authorization: Bearer <token>.
+5. We call the Peloton API (no 401).
 
-Features preserved from previous version:
-- --date YYYY-MM-DD  (defaults to "today" in your timezone)
-- --two-graphs       (split: power+zones vs HR/Cad/Res)
-- --stacked          (stacked HR/power zones + cadence/resistance in one PNG)
-- --cleanup          (wipe output dir before writing)
-- --tz IANA zone     (default America/New_York)
-- --hr-ignore-min / --hr-lead-sec / --hr-smooth-sec for HR preprocessing (stacked mode)
-- inline HTML gallery with clickable thumbnails
-- TSS, NP, IF, VI, FTP, PR badge, warmup/main/cooldown split, etc.
-
-Dependencies:
-  pip install selenium webdriver-manager matplotlib python-dateutil requests
+This avoids /auth/login and avoids 403/401 issues caused by cookie-only auth.
 """
 
 import argparse
@@ -35,15 +24,16 @@ from typing import List, Optional, Tuple
 
 import requests
 import matplotlib
-matplotlib.use("Agg")  # run headless for plotting
+matplotlib.use("Agg")  # headless plotting
 import matplotlib.pyplot as plt
 from dateutil import tz
 
-# selenium imports
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+try:
+    from zoneinfo import available_timezones
+except Exception:
+    available_timezones = None
 
+PELOTON_BASE = "https://api.onepeloton.com"
 DEBUG_API = False
 
 COMMON_TZS = [
@@ -56,12 +46,6 @@ COMMON_TZS = [
     "Australia/Sydney", "Australia/Melbourne",
 ]
 
-try:
-    from zoneinfo import available_timezones
-except Exception:
-    available_timezones = None
-
-# ----------------- small helpers -----------------
 def print_extra_help_and_exit(parser: argparse.ArgumentParser, code: int = 0):
     print(parser.format_help())
     print("\nAcceptable timezone examples (IANA):")
@@ -104,7 +88,6 @@ class WorkoutSeries:
     seconds: List[float]
     values: List[Optional[float]]
 
-# ----------------- math / parsing helpers -----------------
 def _parse_summary_value(summaries: List[dict], slug: str) -> Optional[float]:
     for s in summaries or []:
         if s.get("slug") == slug and isinstance(s.get("value"), (int, float)):
@@ -147,19 +130,14 @@ def _compute_normalized_power(values: List[Optional[float]], window_secs: int, e
     k = max(1, int(round(window_secs / every_n)))
     if len(seq) < k:
         return None
-
-    q = []
-    sm = 0.0
-    acc = []
-
+    q, sm, acc = [], 0.0, []
     for v in seq:
-        q.append(v)
-        sm += v
+        q.append(v); sm += v
         if len(q) > k:
             sm -= q.pop(0)
         if len(q) == k:
             m = sm / k
-            acc.append(m ** 4)
+            acc.append(m**4)
     if not acc:
         return None
     return (sum(acc) / len(acc)) ** 0.25
@@ -186,117 +164,176 @@ def _parse_segments_from_pg(pg: dict, fallback_duration: int) -> Tuple[int, int,
     total = int(pg.get("duration") or fallback_duration or 0)
     return 0, total, 0
 
-# ----------------- selenium login & cookie capture -----------------
-def get_authenticated_session_via_browser(debug=False) -> requests.Session:
+# ---- AUTH VIA BROWSER -------------------------------------------------
+
+def launch_browser_and_get_session(debug=False) -> requests.Session:
     """
-    1. Launches Chrome.
-    2. Opens Peloton members site.
-    3. You log in manually.
-    4. Press Enter in terminal.
-    5. We pull cookies out of Chrome and build a requests.Session with them.
+    1. Launch Chrome (not headless).
+    2. You log in at https://members.onepeloton.com/ manually (MFA etc.).
+    3. We read localStorage from that origin to extract an access_token.
+    4. We also grab cookies (not strictly required but harmless).
+    5. We build a requests.Session() that sends:
+          Authorization: Bearer <access_token>
+          Accept / UA / Origin / Referer
+    This is what Peloton's web app does for API calls.
     """
 
+    from webdriver_manager.chrome import ChromeDriverManager
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    import time
+    import json as jsonlib
+
+    print("Launching Chrome... You'll log in manually.")
     service = Service(ChromeDriverManager().install())
     options = webdriver.ChromeOptions()
-    # Make it feel less like automation
     options.add_argument("--disable-blink-features=AutomationControlled")
-    # visible browser (no headless)
-
     driver = webdriver.Chrome(service=service, options=options)
-    try:
-        driver.get("https://members.onepeloton.com/")
-        print("A Chrome window just opened.")
-        print("Log into Peloton in that browser. Navigate anywhere so you're fully signed in.")
-        input("When you're done and you can see your dashboard/classes, press Enter here... ")
 
-        # grab cookies
-        ck_list = driver.get_cookies()  # [{'name':..., 'value':..., 'domain':..., ...}, ...]
+    try:
+        # Step 1: log in
+        driver.get("https://members.onepeloton.com/")
+        print("Log in fully (password, MFA).")
+        input("When you're fully logged in and can see your dashboard, press Enter here... ")
+
+        # Step 2: dump localStorage to hunt for access_token
+        ls_data = driver.execute_script(
+            "var d={}; for (var i=0;i<localStorage.length;i++){"
+            "var k=localStorage.key(i); d[k]=localStorage.getItem(k);} return d;"
+        )
+
         if debug:
-            print("Captured cookies:")
-            for c in ck_list:
-                print(c["name"], "=", c["value"])
+            print("\n=== localStorage keys ===")
+            for k, v in ls_data.items():
+                preview = v if isinstance(v, str) else str(v)
+                print(f"{k}: {preview[:120]}...")
+
+        access_token = None
+
+        # Peloton stores Auth0 responses as JSON blobs. Let's parse each value and
+        # look for .access_token explicitly.
+        for k, v in ls_data.items():
+            if not isinstance(v, str):
+                continue
+            # try to parse as JSON safely
+            try:
+                parsed = jsonlib.loads(v)
+            except Exception:
+                parsed = None
+
+            if isinstance(parsed, dict):
+                # Auth0 blobs look like:
+                # { "body": { "access_token": "...", "id_token": "...", ... }, ... }
+                # OR sometimes flat { "access_token": "...", "id_token": "...", ... }
+                possible_body = parsed.get("body")
+                if isinstance(possible_body, dict) and "access_token" in possible_body:
+                    access_token = possible_body.get("access_token")
+                elif "access_token" in parsed:
+                    access_token = parsed.get("access_token")
+
+            # if we found something that looks like a JWT, bail out
+            if isinstance(access_token, str) and access_token.count(".") >= 2:
+                break
+
+        if not access_token:
+            raise RuntimeError("Could not locate access_token in localStorage. Are you definitely logged in?")
+
+        if debug:
+            print(f"\nFound access_token (truncated): {access_token[:30]}...")
+
+        # Step 3: grab cookies from both api and members (optional but we'll keep doing it)
+        driver.get("https://api.onepeloton.com/api/me")
+        time.sleep(1)
+        raw_cookies_api = driver.get_cookies()
+
+        driver.get("https://members.onepeloton.com/")
+        time.sleep(1)
+        raw_cookies_members = driver.get_cookies()
 
     finally:
-        # Close browser
         driver.quit()
 
-    # Build requests session
+    # Dedupe cookies
+    dedup = {}
+    for c in (raw_cookies_api + raw_cookies_members):
+        key = (c.get("name"), c.get("domain"), c.get("path"))
+        dedup[key] = c
+    final_cookies = list(dedup.values())
+
+    if debug:
+        print("=== Cookies captured ===")
+        by_domain = {}
+        for c in final_cookies:
+            by_domain.setdefault(c.get("domain"), []).append(c["name"])
+        for dom, names in by_domain.items():
+            print(f" {dom}: {names}")
+
+    # Build the requests session with correct headers
     s = requests.Session()
-    # baseline headers to mimic browser
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15)",
+        "Accept": "application/json, text/plain, */*",
         "Origin": "https://members.onepeloton.com",
         "Referer": "https://members.onepeloton.com/",
-        "Accept": "application/json, text/plain, */*",
+        "Authorization": f"Bearer {access_token}",
     })
 
-    # attach cookies to the session for relevant peloton domains
-    for c in ck_list:
-        # we only care about cookies that apply to .onepeloton.com or members.onepeloton.com
-        domain = c.get("domain", "")
-        if "onepeloton.com" in domain:
-            s.cookies.set(c["name"], c["value"], domain=domain, path=c.get("path", "/"))
+    # Attach cookies (they might not be necessary anymore, but harmless)
+    for c in final_cookies:
+        dom = c.get("domain", "")
+        if "onepeloton.com" in dom:
+            s.cookies.set(
+                name=c["name"],
+                value=c["value"],
+                domain=dom,
+                path=c.get("path", "/")
+            )
 
     return s
 
-# ----------------- Peloton API calls USING the cookie-backed session -----------------
+
+# ---- Peloton API calls using that session -----------------------------
+
 def get_user_profile(session: requests.Session) -> dict:
-    r = session.get("https://api.onepeloton.com/api/me")
+    r = session.get(f"{PELOTON_BASE}/api/me")
     if r.status_code != 200:
         raise RuntimeError(f"/api/me failed {r.status_code}: {r.text}")
     me = r.json()
     _debug_print("/api/me", me)
     return me
 
-def _fetch_workouts_pages(session: requests.Session, user_id: str, max_pages: int = 10):
-    """
-    We'll call the workouts endpoint page by page.
-    Historically: GET /api/user/<user_id>/workouts?limit=50&page=N&joins=ride,ride.instructor
-    We'll try with joins first, then fallback w/o joins if needed.
-    """
-    base = f"https://api.onepeloton.com/api/user/{user_id}/workouts"
+def _fetch_workouts_pages(session: requests.Session, url: str, base_params: dict, max_pages: int = 10):
     results = []
-
     for page in range(max_pages):
-        params = {
-            "limit": 50,
-            "page": page,
-            "joins": "ride,ride.instructor"
-        }
-        r = session.get(base, params=params)
+        params = dict(base_params)
+        params["page"] = page
+        r = session.get(url, params=params)
         if r.status_code in (400, 401, 403, 404, 429, 500):
-            # fallback to without joins
-            params.pop("joins", None)
-            r = session.get(base, params=params)
-
-        if r.status_code != 200:
-            raise RuntimeError(f"workouts fetch failed {r.status_code} page {page}: {r.text}")
-
+            try:
+                detail = r.json()
+            except Exception:
+                detail = r.text
+            raise RuntimeError(f"Workouts fetch failed {r.status_code} at {url} page {page}: {detail}")
         data = r.json()
-        _debug_print(f"/workouts?page={page}", data)
-
+        _debug_print(f"{url}?page={page}", data)
         items = data.get("data") or data.get("workouts") or data.get("items") or []
         if not items:
             break
-
         results.extend(items)
-        # heuristic: if < limit, we're done
-        if len(items) < params.get("limit", 50):
+        if len(items) < base_params.get("limit", 50):
             break
-
     return results
 
 def _get_ride_details(session: requests.Session, ride_id: str) -> dict:
-    candidates = [
-        f"https://api.onepeloton.com/api/ride/{ride_id}",
-        f"https://api.onepeloton.com/api/ride/{ride_id}/details",
-    ]
-    for ep in candidates:
-        r = session.get(ep)
-        if r.status_code == 200:
-            data = r.json()
-            _debug_print(ep, data)
-            return data
+    for ep in (f"{PELOTON_BASE}/api/ride/{ride_id}", f"{PELOTON_BASE}/api/ride/{ride_id}/details"):
+        try:
+            r = session.get(ep)
+            if r.status_code == 200:
+                data = r.json()
+                _debug_print(ep, data)
+                return data
+        except Exception:
+            pass
     return {}
 
 def _start_end_epoch_for_date(date_str: Optional[str], tz_str: str) -> Tuple[int, int]:
@@ -315,38 +352,34 @@ def _start_end_epoch_for_date(date_str: Optional[str], tz_str: str) -> Tuple[int
 
 def get_cycling_workouts_for_date(session: requests.Session, user_id: str, tz_str: str, date_str: Optional[str]):
     start_epoch, end_epoch = _start_end_epoch_for_date(date_str, tz_str)
-    items = _fetch_workouts_pages(session, user_id, max_pages=10)
-
+    base = f"{PELOTON_BASE}/api/user/{user_id}/workouts"
+    items = _fetch_workouts_pages(session, base, {"limit": 50, "joins": "ride,ride.instructor"}, max_pages=4) or \
+            _fetch_workouts_pages(session, base, {"limit": 50}, max_pages=4)
     filtered = []
     for w in items:
         created = int(w.get("created_at") or w.get("start_time") or 0)
         discipline = (w.get("fitness_discipline") or w.get("sport_type") or "").lower()
         disp = (w.get("fitness_discipline_display_name") or "").lower()
-
         if start_epoch <= created < end_epoch and (discipline == "cycling" or "ride" in disp):
             if not w.get("ride") and w.get("ride_id"):
                 ride = _get_ride_details(session, w["ride_id"]) or {}
                 if ride:
                     w["ride"] = ride
             filtered.append(w)
-
     if DEBUG_API:
         print("\n=== Cycling workouts (date-filtered) ===")
         print(json.dumps(_truncate_for_debug(filtered), indent=2, ensure_ascii=False))
-
     return filtered
 
 def get_performance_graph(session: requests.Session, workout_id: str) -> dict:
-    url = f"https://api.onepeloton.com/api/workout/{workout_id}/performance_graph"
+    url = f"{PELOTON_BASE}/api/workout/{workout_id}/performance_graph"
     r = session.get(url, params={"every_n": 5})
-    if r.status_code != 200:
-        raise RuntimeError(f"performance_graph failed {r.status_code}: {r.text}")
+    r.raise_for_status()
     data = r.json()
-    _debug_print("performance_graph", data)
+    _debug_print(url, data)
     return data
 
 def detect_ftp_from_pg_meta(pg: dict) -> Optional[float]:
-    # try 'ftp' or similar buried keys
     for k in ["ftp","user_ftp","userFtp","UserFtp","functional_threshold_power"]:
         if k in pg and isinstance(pg[k], (int, float)):
             return float(pg[k])
@@ -370,7 +403,6 @@ def detect_ftp_from_profile(profile: dict) -> Optional[float]:
                     return float(v)
     return None
 
-# ----------------- plotting helpers -----------------
 def compute_zone_bands(ftp: float) -> List[Tuple[str, float, float]]:
     return [
         ("Z1 (Active Recovery)", 0.00*ftp, 0.55*ftp),
@@ -395,20 +427,15 @@ def _annotate_header_footer(fig, series: WorkoutSeries, ftp: float, ride_meta: d
     done_date = ride_meta.get("done_date") or ""
     username_disp = ride_meta.get("username") or ""
 
-    plt.figtext(0.01, 0.98,
-                f"{title} — {instructor}" if instructor else f"{title}",
+    plt.figtext(0.01, 0.98, f"{title} — {instructor}" if instructor else f"{title}",
                 ha="left", va="top", fontsize=14, fontweight="bold")
-
     if pr_flag:
         plt.figtext(0.01, 0.915, "PR", ha="left", va="top", fontsize=11, fontweight="bold",
                     bbox=dict(facecolor="#ffe570", edgecolor="#d4b300", boxstyle="round,pad=0.3"))
-
     plt.figtext(0.99, 0.98, f"Expected TSS: —", ha="right", va="top", fontsize=12)
 
-    plt.figtext(0.01, 0.94, f"Aired: {aired}",
-                ha="left", va="top", fontsize=11)
-    plt.figtext(0.50, 0.94, f"Done: {done_date}    User: {username_disp}",
-                ha="center", va="top", fontsize=11)
+    plt.figtext(0.01, 0.94, f"Aired: {aired}", ha="left", va="top", fontsize=11)
+    plt.figtext(0.50, 0.94, f"Done: {done_date}    User: {username_disp}", ha="center", va="top", fontsize=11)
 
     row1 = (
         f"Average Power: {stats.get('avg_output_w','—')} W    "
@@ -425,11 +452,8 @@ def _annotate_header_footer(fig, series: WorkoutSeries, ftp: float, ride_meta: d
         f"Distance: {stats.get('distance_mi','—')} mi    "
         f"Total Output: {stats.get('total_output_kj','—')} kJ"
     )
-
-    plt.figtext(0.99, 0.94,
-                f"Warm Up: {stats.get('warm_hms','—')}   Main Set: {stats.get('main_hms','—')}   Cool Down: {stats.get('cool_hms','—')}",
+    plt.figtext(0.99, 0.94, f"Warm Up: {stats.get('warm_hms','—')}   Main Set: {stats.get('main_hms','—')}   Cool Down: {stats.get('cool_hms','—')}",
                 ha="right", va="top", fontsize=11)
-
     plt.figtext(0.5, 0.045, row1, ha="center", va="bottom", fontsize=11)
     plt.figtext(0.5, 0.018, row2, ha="center", va="bottom", fontsize=11)
 
@@ -458,26 +482,19 @@ def plot_single_graph(series: WorkoutSeries, ftp: float, out_dir: str, ride_meta
     ax2 = ax.twinx()
     ax2.set_ylabel("Cadence (rpm) / HR (bpm) / Resistance (%)")
     lines_other = []
-    for key, style in [
-        ("_hr_vals", dict(linewidth=1.2, alpha=0.85, label="Heart Rate")),
-        ("_cad_vals", dict(linestyle="--", linewidth=1.1, alpha=0.9, label="Cadence")),
-        ("_res_vals", dict(linestyle=":", linewidth=1.1, alpha=0.9, label="Resistance")),
-    ]:
+    for key, style in [("_hr_vals", dict(linewidth=1.2, alpha=0.85, label="Heart Rate")),
+                       ("_cad_vals", dict(linestyle="--", linewidth=1.1, alpha=0.9, label="Cadence")),
+                       ("_res_vals", dict(linestyle=":", linewidth=1.1, alpha=0.9, label="Resistance"))]:
         vals = ride_meta.get(key)
         if vals:
-            l, = ax2.plot(xmins, vals[:len(xmins)], **style)
-            lines_other.append(l)
+            l, = ax2.plot(xmins, vals[:len(xmins)], **style); lines_other.append(l)
 
-    ax.set_xlim(left=0)
-    ax.set_ylim(bottom=ymin, top=ymax)
-    ax.set_xlabel("Time (minutes)", fontweight="bold")
-    ax.set_ylabel("Watts", fontweight="bold")
+    ax.set_xlim(left=0); ax.set_ylim(bottom=ymin, top=ymax)
+    ax.set_xlabel("Time (minutes)", fontweight="bold"); ax.set_ylabel("Watts", fontweight="bold")
     ax.grid(True, linestyle="--", alpha=0.35)
-
     handles = [line_power] + lines_other
     if handles:
-        ax.legend(handles, [h.get_label() for h in handles],
-                  loc="upper left", fontsize=9, framealpha=0.9)
+        ax.legend(handles, [h.get_label() for h in handles], loc="upper left", fontsize=9, framealpha=0.9)
 
     _annotate_header_footer(fig, series, ftp, ride_meta, stats)
 
@@ -485,13 +502,11 @@ def plot_single_graph(series: WorkoutSeries, ftp: float, out_dir: str, ride_meta
     ts = dt.datetime.fromtimestamp(series.start_time).strftime("%Y%m%d_%H%M")
     out_path = os.path.join(out_dir, f"{ts}_{series.workout_id[:8]}_single.png")
     plt.tight_layout(rect=[0, 0.07, 1, 0.90])
-    plt.savefig(out_path, dpi=150)
-    plt.close(fig)
+    plt.savefig(out_path, dpi=150); plt.close(fig)
     return out_path
 
 def plot_split_graphs(series: WorkoutSeries, ftp: float, out_dir: str, ride_meta: dict, stats: dict) -> Tuple[str, str]:
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11})
-    # POWER / ZONES
     fig1 = plt.figure(figsize=(14, 6))
     ax1 = plt.gca()
     ax1.set_facecolor("#f9f9f9")
@@ -511,34 +526,26 @@ def plot_split_graphs(series: WorkoutSeries, ftp: float, out_dir: str, ride_meta
     xmins = [s/60.0 for s in series.seconds]
     y = [v if v is not None else float('nan') for v in series.values]
     ax1.plot(xmins, y, linewidth=2.2, color="#5e35b1", label="Output/Power")
-
-    ax1.set_xlim(left=0)
-    ax1.set_ylim(bottom=ymin, top=ymax)
-    ax1.set_xlabel("Time (minutes)", fontweight="bold")
-    ax1.set_ylabel("Watts", fontweight="bold")
+    ax1.set_xlim(left=0); ax1.set_ylim(bottom=ymin, top=ymax)
+    ax1.set_xlabel("Time (minutes)", fontweight="bold"); ax1.set_ylabel("Watts", fontweight="bold")
     ax1.grid(True, linestyle="--", alpha=0.35)
     ax1.legend(loc="upper left", fontsize=9, framealpha=0.9)
 
     _annotate_header_footer(fig1, series, ftp, ride_meta, stats)
-
     os.makedirs(out_dir, exist_ok=True)
     ts = dt.datetime.fromtimestamp(series.start_time).strftime("%Y%m%d_%H%M")
     out_path_1 = os.path.join(out_dir, f"{ts}_{series.workout_id[:8]}_power.png")
     plt.tight_layout(rect=[0, 0.07, 1, 0.90])
-    plt.savefig(out_path_1, dpi=150)
-    plt.close(fig1)
+    plt.savefig(out_path_1, dpi=150); plt.close(fig1)
 
-    # HR / CAD / RES
     fig2 = plt.figure(figsize=(14, 5.5))
     ax2 = plt.gca()
     ax2.set_facecolor("#f9f9f9")
     lines = []
 
-    for key, style in [
-        ("_hr_vals", dict(linewidth=1.4, alpha=0.95, label="Heart Rate")),
-        ("_cad_vals", dict(linestyle="--", linewidth=1.2, alpha=0.95, label="Cadence")),
-        ("_res_vals", dict(linestyle=":", linewidth=1.2, alpha=0.95, label="Resistance")),
-    ]:
+    for key, style in [("_hr_vals", dict(linewidth=1.4, alpha=0.95, label="Heart Rate")),
+                       ("_cad_vals", dict(linestyle="--", linewidth=1.2, alpha=0.95, label="Cadence")),
+                       ("_res_vals", dict(linestyle=":", linewidth=1.2, alpha=0.95, label="Resistance"))]:
         vals = ride_meta.get(key)
         if vals:
             l, = ax2.plot(xmins, vals[:len(xmins)], **style)
@@ -549,32 +556,23 @@ def plot_split_graphs(series: WorkoutSeries, ftp: float, out_dir: str, ride_meta
     ax2.set_ylabel("HR (bpm) / Cadence (rpm) / Resistance (%)")
     ax2.grid(True, linestyle="--", alpha=0.35)
     if lines:
-        ax2.legend(lines, [l.get_label() for l in lines],
-                   loc="upper left", fontsize=9, framealpha=0.9)
+        ax2.legend(lines, [l.get_label() for l in lines], loc="upper left", fontsize=9, framealpha=0.9)
 
     title = ride_meta.get("title") or series.title
     instructor = ride_meta.get("instructor") or ""
-    plt.figtext(0.01, 0.98,
-                f"{title} — {instructor}" if instructor else f"{title}",
-                ha="left", va="top", fontsize=13, fontweight="bold")
+    plt.figtext(0.01, 0.98, f"{title} — {instructor}" if instructor else f"{title}", ha="left", va="top", fontsize=13, fontweight="bold")
 
     out_path_2 = os.path.join(out_dir, f"{ts}_{series.workout_id[:8]}_overlays.png")
     plt.tight_layout(rect=[0, 0.03, 1, 0.93])
-    plt.savefig(out_path_2, dpi=150)
-    plt.close(fig2)
+    plt.savefig(out_path_2, dpi=150); plt.close(fig2)
 
     return out_path_1, out_path_2
 
-def plot_stacked_graphs(series: WorkoutSeries, ftp: float, out_dir: str,
-                        ride_meta: dict, stats: dict, args) -> str:
-    """
-    One image with two vertically-stacked subplots:
-      Top: HR vs Output/Power (with zone bands on the power axis)
-      Bottom: Cadence + Resistance
-    """
+def plot_stacked_graphs(series: WorkoutSeries, ftp: float, out_dir: str, ride_meta: dict, stats: dict, args) -> str:
     import math
-    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11})
+    from collections import deque
 
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11})
     fig, (ax_top_left, ax_bot_left) = plt.subplots(
         2, 1, figsize=(14, 10), sharex=True,
         gridspec_kw={"height_ratios": [2, 1]}
@@ -585,11 +583,10 @@ def plot_stacked_graphs(series: WorkoutSeries, ftp: float, out_dir: str,
     xmins = [s / 60.0 for s in xsecs]
     power_vals = [v if v is not None else float('nan') for v in series.values]
 
-    raw_hr   = (ride_meta.get("_hr_vals") or [])[:len(xsecs)]
+    raw_hr = (ride_meta.get("_hr_vals") or [])[:len(xsecs)]
     cad_vals = (ride_meta.get("_cad_vals") or [])[:len(xsecs)]
     res_vals = (ride_meta.get("_res_vals") or [])[:len(xsecs)]
 
-    # estimate sampling step
     if len(xsecs) >= 3:
         steps = [max(1, xsecs[i] - xsecs[i-1]) for i in range(1, len(xsecs))]
         step_sec = sorted(steps)[len(steps)//2]
@@ -599,47 +596,43 @@ def plot_stacked_graphs(series: WorkoutSeries, ftp: float, out_dir: str,
     def _ma(vals, win):
         if win <= 1:
             return vals
-        out = []
-        from collections import deque
+        buf = []
+        ssum = 0.0
         q = deque()
-        s = 0.0
         for v in vals:
             if v is None:
                 v = float('nan')
             q.append(v)
-            s += v if not math.isnan(v) else 0.0
+            if not math.isnan(v):
+                ssum += v
             if len(q) > win:
                 left = q.popleft()
                 if not math.isnan(left):
-                    s -= left
+                    ssum -= left
             non_n = sum(0 if math.isnan(u) else 1 for u in q)
-            out.append((s / non_n) if non_n else float('nan'))
-        return out
+            buf.append((ssum / non_n) if non_n else float('nan'))
+        return buf
 
     hr_vals = raw_hr[:]
 
-    # mask first N minutes
     if args.hr_ignore_min and args.hr_ignore_min > 0:
         n_ignore = int(round((args.hr_ignore_min * 60) / step_sec))
         for i in range(min(n_ignore, len(hr_vals))):
             hr_vals[i] = float('nan')
 
-    # lead/lag HR
     if args.hr_lead_sec and args.hr_lead_sec != 0.0:
-        shift_n = int(round(args.hr_lead_sec / step_sec))
-        if shift_n > 0:
-            hr_vals = hr_vals[shift_n:] + [float('nan')] * min(shift_n, len(xsecs))
-        elif shift_n < 0:
-            shift_n = abs(shift_n)
-            hr_vals = [float('nan')] * min(shift_n, len(xsecs)) + hr_vals[:-shift_n]
+        nshift = int(round(args.hr_lead_sec / step_sec))
+        if nshift > 0:
+            hr_vals = hr_vals[nshift:] + [float('nan')] * min(nshift, len(xsecs))
+        elif nshift < 0:
+            nshift = abs(nshift)
+            hr_vals = [float('nan')] * min(nshift, len(xsecs)) + hr_vals[:-nshift]
 
-    # smooth
     if args.hr_smooth_sec and args.hr_smooth_sec > 0:
         win = max(1, int(round(args.hr_smooth_sec / step_sec)))
         hr_vals = _ma(hr_vals, win)
 
-    # ----- TOP subplot (HR vs Power with zones)
-    ax_hr  = ax_top_left
+    ax_hr = ax_top_left
     ax_pow = ax_hr.twinx()
     ax_hr.set_facecolor("#f9f9f9")
 
@@ -658,20 +651,14 @@ def plot_stacked_graphs(series: WorkoutSeries, ftp: float, out_dir: str,
     hr_line = None
     if hr_vals:
         hr_line, = ax_hr.plot(
-            xmins,
-            hr_vals,
-            linewidth=1.8,
-            alpha=0.95,
-            label="Heart Rate",
-            color="#d9534f"  # red tone
+            xmins, hr_vals,
+            linewidth=1.8, alpha=0.95, label="Heart Rate",
+            color="#d9534f"
         )
 
     pow_line, = ax_pow.plot(
-        xmins,
-        power_vals,
-        linewidth=2.2,
-        alpha=0.95,
-        label="Output/Power"
+        xmins, power_vals,
+        linewidth=2.2, alpha=0.95, label="Output/Power"
     )
 
     ax_hr.set_ylabel("Heart Rate (bpm)", fontweight="bold")
@@ -682,34 +669,27 @@ def plot_stacked_graphs(series: WorkoutSeries, ftp: float, out_dir: str,
 
     handles_top = [h for h in [hr_line, pow_line] if h is not None]
     if handles_top:
-        ax_hr.legend(handles_top, [h.get_label() for h in handles_top],
-                     loc="upper left", fontsize=9, framealpha=0.9)
+        ax_hr.legend(
+            handles_top, [h.get_label() for h in handles_top],
+            loc="upper left", fontsize=9, framealpha=0.9
+        )
 
-    # ----- BOTTOM subplot (Cadence / Resistance)
     ax_cad = ax_bot_left
     ax_cad.set_facecolor("#f9f9f9")
 
     cad_line = None
     if cad_vals:
         cad_line, = ax_cad.plot(
-            xmins,
-            cad_vals,
-            linestyle="--",
-            linewidth=1.4,
-            alpha=0.95,
-            label="Cadence"
+            xmins, cad_vals,
+            linestyle="--", linewidth=1.4, alpha=0.95, label="Cadence"
         )
 
     res_line = None
     if res_vals:
         ax_res = ax_cad.twinx()
         res_line, = ax_res.plot(
-            xmins,
-            res_vals,
-            linestyle=":",
-            linewidth=1.2,
-            alpha=0.9,
-            label="Resistance"
+            xmins, res_vals,
+            linestyle=":", linewidth=1.2, alpha=0.9, label="Resistance"
         )
         ax_res.set_ylabel("Resistance (%)", fontweight="bold")
     else:
@@ -721,10 +701,11 @@ def plot_stacked_graphs(series: WorkoutSeries, ftp: float, out_dir: str,
 
     handles_bot = [h for h in [cad_line, res_line] if h is not None]
     if handles_bot:
-        ax_cad.legend(handles_bot, [h.get_label() for h in handles_bot],
-                      loc="upper left", fontsize=9, framealpha=0.9)
+        ax_cad.legend(
+            handles_bot, [h.get_label() for h in handles_bot],
+            loc="upper left", fontsize=9, framealpha=0.9
+        )
 
-    # global header/footer on fig
     _annotate_header_footer(fig, series, ftp, ride_meta, stats)
 
     os.makedirs(out_dir, exist_ok=True)
@@ -735,9 +716,7 @@ def plot_stacked_graphs(series: WorkoutSeries, ftp: float, out_dir: str,
     plt.close(fig)
     return out_path
 
-# ----------------- HTML output -----------------
-def write_inline_gallery(outdir: str, image_paths: List[str],
-                         page_title: str, username: str, date_label: str):
+def write_inline_gallery(outdir: str, image_paths: List[str], page_title: str, username: str, date_label: str):
     os.makedirs(outdir, exist_ok=True)
     html_path = os.path.join(outdir, "index.html")
     with open(html_path, "w", encoding="utf-8") as f:
@@ -757,17 +736,12 @@ header .meta{color:#cbd5ff;font-size:.95rem;opacity:.85}
 </style>
 </head><body>
 """)
-        f.write(f"<header><h1>{page_title}</h1>"
-                f"<div class='meta'>User: <strong>{username}</strong> · {date_label}</div>"
-                f"</header>\n")
+        f.write(f"<header><h1>{page_title}</h1><div class='meta'>User: <strong>{username}</strong> · {date_label}</div></header>\n")
         if image_paths:
             f.write("<div class='grid'>\n")
             for img in image_paths:
                 base = os.path.basename(img)
-                f.write(
-                    f"  <div class='card'><a href='{base}' target='_blank' rel='noopener'>"
-                    f"<img src='{base}' alt='Ride graph'></a></div>\n"
-                )
+                f.write(f"  <div class='card'><a href='{base}' target='_blank' rel='noopener'><img src='{base}' alt='Ride graph'></a></div>\n")
             f.write("</div>\n")
         else:
             f.write("<div class='empty'>No cycling workouts found for the selected date.</div>\n")
@@ -775,13 +749,11 @@ header .meta{color:#cbd5ff;font-size:.95rem;opacity:.85}
     return html_path
 
 
-# ----------------- main -----------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Launch browser, grab Peloton cookie, then generate ride graphs for a given date.",
+        description="Generate Peloton graphs for rides on a given date (default: today).",
         add_help=True
     )
-
     parser.add_argument("--tz", default=os.getenv("LOCAL_TZ","America/New_York"),
                         help="IANA timezone (e.g., America/New_York)")
     parser.add_argument("--date", default=None,
@@ -789,29 +761,27 @@ def main():
     parser.add_argument("--outdir", default="peloton_graphs",
                         help="Output directory for images + index.html")
     parser.add_argument("--two-graphs", action="store_true",
-                        help="If set, produce two plots per ride (power/zones AND HR/Cad/Res).")
-    parser.add_argument("--stacked", action="store_true",
-                        help="One image with two stacked subplots (HR vs Power+Zones, then Cadence/Resistance).")
+                        help="Produce two plots per ride (power/zones AND HR/Cad/Res).")
     parser.add_argument("--cleanup", action="store_true",
-                        help="If set, clear the output directory before writing new files.")
+                        help="Clear output dir before writing new files.")
     parser.add_argument("--debug-api", action="store_true",
-                        help="Print truncated JSON of Peloton API responses (filtered set).")
+                        help="Print truncated JSON of Peloton API responses.")
     parser.add_argument("--list-timezones", action="store_true",
                         help="List available IANA timezones detected on this system and exit.")
+    parser.add_argument("--stacked", action="store_true",
+                        help="One image with two stacked subplots (top: HR vs Output+Zones; bottom: Cadence vs Output).")
     parser.add_argument("--hr-ignore-min", type=float, default=0.0,
-                        help="Minutes of heart-rate to ignore/mask from the start (e.g., 2.5)")
+        help="Minutes of HR to ignore/mask from the start (e.g., 2.5)")
     parser.add_argument("--hr-lead-sec", type=float, default=0.0,
-                        help="Shift HR curve left (lead) by N seconds to align with power; negative to lag.")
+        help="Shift HR curve left (lead) by N seconds to align w/ power; negative to lag")
     parser.add_argument("--hr-smooth-sec", type=float, default=0.0,
-                        help="Apply moving-average smoothing window to HR (in seconds, e.g., 10).")
+        help="Moving-average smooth window for HR, in seconds (e.g., 10)")
+    args = parser.parse_args()
 
-    # Auto-help if no args at all
+    # auto print help if literally no args at all
     if len(sys.argv) == 1:
         print_extra_help_and_exit(parser, code=0)
 
-    args = parser.parse_args()
-
-    # timezone listing
     if args.list_timezones:
         if available_timezones:
             for t in sorted(list(available_timezones())):
@@ -825,16 +795,17 @@ def main():
     global DEBUG_API
     DEBUG_API = bool(args.debug_api)
 
-    # cleanup outdir
+    # Cleanup outdir if requested
     if args.cleanup and os.path.isdir(args.outdir):
         shutil.rmtree(args.outdir, ignore_errors=True)
     os.makedirs(args.outdir, exist_ok=True)
 
-    # STEP 1: interactive browser login + cookie capture
-    session = get_authenticated_session_via_browser(debug=DEBUG_API)
+    # NEW AUTH: Launch browser, grab token, build session
+    session = launch_browser_and_get_session(debug=DEBUG_API)
 
-    # STEP 2: call Peloton APIs using that session
+    # Now hit /api/me with that session (using Bearer token)
     me = get_user_profile(session)
+
     api_username = (
         me.get("username")
         or me.get("name")
@@ -844,45 +815,36 @@ def main():
         me.get("id")
         or me.get("user_id")
     )
-    if not user_id:
-        raise RuntimeError("Could not determine user_id from /api/me response.")
 
-    # workouts for requested date (or today)
     workouts = get_cycling_workouts_for_date(session, user_id, args.tz, args.date)
+
     if not workouts:
         print("No cycling workouts found for the selected date.")
-        date_label = args.date or dt.datetime.now().strftime("%Y-%m-%d")
-        write_inline_gallery(args.outdir, [], "Peloton — Rides", api_username, date_label)
+        write_inline_gallery(
+            args.outdir, [],
+            "Peloton — Rides", api_username,
+            (args.date or dt.datetime.now().strftime("%Y-%m-%d"))
+        )
         return
 
     ftp_from_profile = detect_ftp_from_profile(me)
-
     produced_images = []
 
     for w in workouts:
         workout_id = w["id"]
 
-        # hydrate ride info if needed
         ride = w.get("ride") or {}
-        if (not ride) and w.get("ride_id"):
+        if not ride and w.get("ride_id"):
             ride = _get_ride_details(session, w["ride_id"]) or {}
+
         title = (ride.get("title") or w.get("title") or "Peloton Ride")
-        instructor = (
-            (ride.get("instructor") or {}).get("name")
-            or (ride.get("instructor") or {}).get("display_name")
-            or ""
-        )
+        instr_obj = (ride.get("instructor") or {})
+        instructor = instr_obj.get("name") or instr_obj.get("display_name") or ""
         start_time = int(w.get("start_time") or w.get("created_at") or 0)
 
-        # performance graph
         pg = get_performance_graph(session, workout_id)
 
-        # timebase
-        seconds = (
-            pg.get("seconds_since_pedaling_start")
-            or pg.get("seconds_since_start")
-            or []
-        )
+        seconds = pg.get("seconds_since_pedaling_start") or pg.get("seconds_since_start") or []
         every_n = _infer_every_n_from_seconds(seconds)
 
         duration = int(w.get("duration") or 0)
@@ -891,32 +853,24 @@ def main():
         if duration <= 0 and seconds:
             duration = int(round(seconds[-1] - seconds[0]))
 
-        # pick a primary metric series
         metrics = pg.get("metrics", [])
         power_metric = next((m for m in metrics if m.get("slug") == "power"), None)
         output_metric = next((m for m in metrics if m.get("slug") == "output"), None)
-        chosen = (
-            power_metric
-            or output_metric
-            or next((m for m in metrics if isinstance(m.get("values"), list)), None)
-        )
+        chosen = power_metric or output_metric or next((m for m in metrics if isinstance(m.get("values"), list)), None)
         if not chosen:
             print(f"Skipping {workout_id}: no numeric series found.")
             continue
 
         slug = chosen.get("slug", "output")
-        values = chosen.get("values") or []
+        values = (chosen.get("values") or [])
         n = min(len(seconds), len(values))
         seconds, values = seconds[:n], values[:n]
 
-        # overlay series
         hr_vals = _get_metric_series(pg, "heart_rate")
         cad_vals = _get_metric_series(pg, "cadence")
         res_vals = _get_metric_series(pg, "resistance")
 
         summaries = pg.get("summaries", [])
-
-        # total output in kJ
         total_output_kj = None
         if isinstance(w.get("total_work"), (int, float)):
             total_output_kj = float(w["total_work"]) / 1000.0
@@ -929,8 +883,7 @@ def main():
         distance_mi = _parse_summary_value(summaries, "distance")
 
         avg_output_w = _avg_metric_from_pg(pg, "output")
-        if (avg_output_w is None and output_metric
-                and isinstance(output_metric.get("average_value"), (int, float))):
+        if avg_output_w is None and output_metric and isinstance(output_metric.get("average_value"), (int, float)):
             avg_output_w = float(output_metric["average_value"])
         if avg_output_w is None:
             avg_output_w = _avg_metric_from_pg(pg, "power")
@@ -939,33 +892,20 @@ def main():
         avg_res_pct = _avg_metric_from_pg(pg, "resistance")
 
         ftp = detect_ftp_from_pg_meta(pg) or ftp_from_profile or 250.0
-        np_w = _compute_normalized_power(values, window_secs=30, every_n=every_n)
 
-        if_ratio = None
-        tss = None
-        vi = None
-        if (
-            isinstance(np_w, (int, float))
-            and np_w > 0
-            and ftp > 0
-            and duration > 0
-        ):
+        np_w = _compute_normalized_power(values, window_secs=30, every_n=every_n)
+        if_ratio = tss = vi = None
+        if isinstance(np_w, (int, float)) and np_w > 0 and ftp > 0 and duration > 0:
             if_ratio = np_w / ftp
             # TSS = ((Duration(s) * NP^2) / (FTP^2 * 3600)) * 100
-            tss = ( (duration * (np_w ** 2)) / (ftp ** 2 * 3600) ) * 100.0
+            tss = ((duration * (np_w ** 2)) / (ftp ** 2 * 3600)) * 100.0
             if isinstance(avg_output_w, (int, float)) and avg_output_w > 0:
                 vi = np_w / avg_output_w
 
-        aired_dt = (
-            ride.get("original_air_time")
-            or ride.get("air_time")
-            or ride.get("scheduled_start_time")
-        )
-        if aired_dt:
-            original_air_date = dt.datetime.fromtimestamp(int(aired_dt)).strftime("%a %d %b %Y")
-        else:
-            original_air_date = ""
-
+        aired_dt = (ride.get("original_air_time")
+                    or ride.get("air_time")
+                    or ride.get("scheduled_start_time"))
+        original_air_date = dt.datetime.fromtimestamp(int(aired_dt)).strftime("%a %d %b %Y") if aired_dt else ""
         done_date = dt.datetime.fromtimestamp(start_time).strftime("%a %d %b %Y @%I:%M%p %Z")
 
         warm_s, main_s, cool_s = _parse_segments_from_pg(pg, fallback_duration=duration)
@@ -1006,26 +946,25 @@ def main():
             duration=duration,
             metric_slug=slug,
             seconds=seconds,
-            values=values,
+            values=values
         )
 
         if args.stacked:
             p = plot_stacked_graphs(series, ftp, args.outdir, ride_meta, stats, args)
-            print(f"Saved: {p}")
             produced_images.append(p)
+            print(f"Saved: {p}")
         elif args.two_graphs:
             p1, p2 = plot_split_graphs(series, ftp, args.outdir, ride_meta, stats)
+            produced_images.extend([p1, p2])
             print(f"Saved: {p1}")
             print(f"Saved: {p2}")
-            produced_images.extend([p1, p2])
         else:
             p = plot_single_graph(series, ftp, args.outdir, ride_meta, stats)
-            print(f"Saved: {p}")
             produced_images.append(p)
+            print(f"Saved: {p}")
 
     date_label = args.date or dt.datetime.now().strftime("%Y-%m-%d")
-    html_path = write_inline_gallery(args.outdir, produced_images,
-                                     "Peloton — Rides", api_username, date_label)
+    html_path = write_inline_gallery(args.outdir, produced_images, "Peloton — Rides", api_username, date_label)
     print(f"Wrote gallery: {html_path}")
 
 if __name__ == "__main__":

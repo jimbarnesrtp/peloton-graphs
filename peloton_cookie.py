@@ -350,26 +350,54 @@ def _start_end_epoch_for_date(date_str: Optional[str], tz_str: str) -> Tuple[int
     end_local = start_local + dt.timedelta(days=1)
     return int(start_local.timestamp()), int(end_local.timestamp())
 
-def get_cycling_workouts_for_date(session: requests.Session, user_id: str, tz_str: str, date_str: Optional[str]):
+def get_cycling_workouts_for_date(session: requests.Session, user_id: str, tz_str: str, date_str: Optional[str],
+                                  min_minutes: int = 0):
     start_epoch, end_epoch = _start_end_epoch_for_date(date_str, tz_str)
     base = f"{PELOTON_BASE}/api/user/{user_id}/workouts"
-    items = _fetch_workouts_pages(session, base, {"limit": 50, "joins": "ride,ride.instructor"}, max_pages=4) or \
-            _fetch_workouts_pages(session, base, {"limit": 50}, max_pages=4)
+
+    # Try to include ride joins for duration/instructor, then fall back
+    items = (
+        _fetch_workouts_pages(session, base, {"limit": 50, "joins": "ride,ride.instructor"}, max_pages=4)
+        or _fetch_workouts_pages(session, base, {"limit": 50}, max_pages=4)
+    )
+
     filtered = []
     for w in items:
         created = int(w.get("created_at") or w.get("start_time") or 0)
         discipline = (w.get("fitness_discipline") or w.get("sport_type") or "").lower()
         disp = (w.get("fitness_discipline_display_name") or "").lower()
-        if start_epoch <= created < end_epoch and (discipline == "cycling" or "ride" in disp):
-            if not w.get("ride") and w.get("ride_id"):
-                ride = _get_ride_details(session, w["ride_id"]) or {}
-                if ride:
-                    w["ride"] = ride
-            filtered.append(w)
+
+        if not (start_epoch <= created < end_epoch and (discipline == "cycling" or "ride" in disp)):
+            continue
+
+        # Ensure ride details present if possible (gives us duration)
+        if not w.get("ride") and w.get("ride_id"):
+            ride = _get_ride_details(session, w["ride_id"]) or {}
+            if ride:
+                w["ride"] = ride
+
+        # Duration in seconds (prefer workout key, then ride.duration)
+        dur_sec = 0
+        if isinstance(w.get("duration"), (int, float)):
+            dur_sec = int(w["duration"])
+        elif isinstance((w.get("ride") or {}).get("duration"), (int, float)):
+            dur_sec = int(w["ride"]["duration"])
+
+        # Apply minimum-duration filter if requested
+        if min_minutes and dur_sec and dur_sec < (min_minutes * 60):
+            continue
+
+        filtered.append(w)
+
+    # Sort most-recent first (descending by start/created time)
+    filtered.sort(key=lambda x: int(x.get("start_time") or x.get("created_at") or 0), reverse=True)
+
     if DEBUG_API:
         print("\n=== Cycling workouts (date-filtered) ===")
         print(json.dumps(_truncate_for_debug(filtered), indent=2, ensure_ascii=False))
+
     return filtered
+
 
 def get_performance_graph(session: requests.Session, workout_id: str) -> dict:
     url = f"{PELOTON_BASE}/api/workout/{workout_id}/performance_graph"
@@ -770,6 +798,10 @@ def main():
                         help="List available IANA timezones detected on this system and exit.")
     parser.add_argument("--stacked", action="store_true",
                         help="One image with two stacked subplots (top: HR vs Output+Zones; bottom: Cadence vs Output).")
+    parser.add_argument("--min-minutes", type=int, default=0,
+                        help="Only include rides with duration >= this many minutes (0 = no filter).")
+
+
     parser.add_argument("--hr-ignore-min", type=float, default=0.0,
         help="Minutes of HR to ignore/mask from the start (e.g., 2.5)")
     parser.add_argument("--hr-lead-sec", type=float, default=0.0,
@@ -816,7 +848,7 @@ def main():
         or me.get("user_id")
     )
 
-    workouts = get_cycling_workouts_for_date(session, user_id, args.tz, args.date)
+    workouts = get_cycling_workouts_for_date(session, user_id, args.tz, args.date,min_minutes=args.min_minutes)
 
     if not workouts:
         print("No cycling workouts found for the selected date.")
